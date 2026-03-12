@@ -9,12 +9,14 @@ import (
 	"time"
 )
 
-// Executor manages the running server process.
+// Executor manages the running server process. The done channel is used
+// as a completion barrier — killProcess releases the mutex while waiting
+// on it to avoid deadlocking with the Wait goroutine.
 type Executor struct {
 	command string
 	mu      sync.Mutex
 	cmd     *exec.Cmd
-	done    chan struct{} // closed when current process exits
+	done    chan struct{}
 }
 
 // NewExecutor creates an Executor for the given exec command string.
@@ -23,12 +25,12 @@ func NewExecutor(command string) *Executor {
 }
 
 // Start launches the server process. If one is already running, it is
-// killed first (including all child processes).
+// killed first — including all child processes — via process-group signals
+// so that leaked goroutines or child workers don't linger as zombies.
 func (e *Executor) Start() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Kill existing process if running
 	if e.cmd != nil && e.cmd.Process != nil {
 		e.killProcess()
 	}
@@ -43,6 +45,8 @@ func (e *Executor) Start() error {
 	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Each child gets its own process group so killProcessGroup can send
+	// SIGKILL to the entire tree without hitting hotreload itself.
 	setProcGroup(cmd)
 
 	startTime := time.Now()
@@ -54,7 +58,12 @@ func (e *Executor) Start() error {
 	e.cmd = cmd
 	e.done = make(chan struct{})
 
-	// Monitor the process in a goroutine
+	// Monitor in background. The 2s crash-guard prevents tight restart
+	// loops when the binary panics on startup (e.g., missing config).
+	//
+	// TODO: Add exponential backoff for crash loops instead of a fixed 2s
+	// threshold. Track consecutive sub-2s exits and increase the wait
+	// before the next restart, capping at ~30s.
 	go func() {
 		err := cmd.Wait()
 		elapsed := time.Since(startTime)
@@ -86,14 +95,14 @@ func (e *Executor) Stop() {
 }
 
 // killProcess kills the server and all its children, then waits for exit.
-// Must be called with e.mu held.
+// Must be called with e.mu held. The lock is temporarily released while
+// waiting on the done channel — this is necessary because the Wait
+// goroutine may be trying to log under the same lock on some error paths.
 func (e *Executor) killProcess() {
 	slog.Info("killing server process", "pid", e.cmd.Process.Pid)
 	killProcessGroup(e.cmd)
 
-	// Wait for the process to fully exit
 	if e.done != nil {
-		// Release lock while waiting to avoid deadlock
 		done := e.done
 		e.mu.Unlock()
 		<-done

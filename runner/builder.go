@@ -1,3 +1,7 @@
+// Package runner implements the build-and-execute pipeline for hotreload.
+// Builder handles compilation with context-based cancellation so that a
+// slow build can be aborted the instant a new file change arrives.
+// Executor manages the child server process with process-group isolation.
 package runner
 
 import (
@@ -10,6 +14,8 @@ import (
 )
 
 // Builder runs the build command with context-based cancellation.
+// buildID is a monotonic counter used to avoid a race where an old build's
+// defer clears the cancel func that belongs to a newer build.
 type Builder struct {
 	command string
 	mu      sync.Mutex
@@ -23,10 +29,11 @@ func NewBuilder(command string) *Builder {
 }
 
 // Build runs the build command. If a previous build is still running,
-// it is cancelled first. Returns nil on success, error on failure.
+// it is cancelled first via its context. The mutex is held only to swap
+// the cancel func and bump the buildID — the actual compilation runs
+// lock-free so concurrent triggers can cancel it without deadlocking.
 func (b *Builder) Build() error {
 	b.mu.Lock()
-	// Cancel any in-flight build
 	if b.cancel != nil {
 		slog.Info("cancelling previous build")
 		b.cancel()
@@ -38,6 +45,7 @@ func (b *Builder) Build() error {
 	id := b.buildID
 	b.mu.Unlock()
 
+	// Only nil-out cancel if no newer build has started (guard via buildID).
 	defer func() {
 		b.mu.Lock()
 		if b.buildID == id {
@@ -58,6 +66,9 @@ func (b *Builder) Build() error {
 	cmd.Stderr = os.Stderr
 
 	err := cmd.Run()
+	// Check context first: exec.CommandContext kills the process on
+	// cancellation, which surfaces as an ExitError — we want to
+	// distinguish "cancelled by us" from "genuine compile failure".
 	if ctx.Err() == context.Canceled {
 		slog.Warn("build cancelled")
 		return ctx.Err()
@@ -81,7 +92,9 @@ func (b *Builder) Cancel() {
 }
 
 // parseCommand splits a command string into executable + args.
-// Handles simple quoting but not shell-level features.
+// We do our own tokeniser rather than invoking a shell so the build
+// process inherits hotreload's process group cleanly and we can kill
+// it via context cancellation without orphan shell wrappers.
 func parseCommand(cmd string) []string {
 	var parts []string
 	var current strings.Builder

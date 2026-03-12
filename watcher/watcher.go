@@ -1,3 +1,6 @@
+// Package watcher provides recursive filesystem watching with intelligent
+// filtering. It wraps fsnotify and adds directory auto-discovery so newly
+// created subdirectories are watched without restarting the tool.
 package watcher
 
 import (
@@ -16,6 +19,8 @@ type Event struct {
 }
 
 // Watcher recursively watches a directory tree and emits filtered events.
+// Events is buffered (64) to absorb short bursts without blocking the
+// fsnotify read loop, which would risk kernel event queue overflows.
 type Watcher struct {
 	fsw    *fsnotify.Watcher
 	root   string
@@ -24,7 +29,12 @@ type Watcher struct {
 	done   chan struct{}
 }
 
-// ignoredDirs that should never be watched.
+// ignoredDirs lists directories that should never be watched. Watching
+// .git or node_modules would flood the event channel with irrelevant
+// noise and waste inotify descriptors.
+//
+// TODO: Make this list user-configurable via a .hotreloadignore file or
+// CLI flag to support project-specific exclusion patterns.
 var ignoredDirs = map[string]bool{
 	".git":         true,
 	"node_modules": true,
@@ -62,6 +72,12 @@ func (w *Watcher) Close() error {
 }
 
 // addRecursive walks the directory tree and adds every eligible dir.
+// We use filepath.Walk (not WalkDir) because we need the full FileInfo to
+// distinguish directories.
+//
+// TODO: filepath.Walk follows symlinks, which can cause infinite loops on
+// deeply nested or circular symlink trees. Consider switching to WalkDir
+// with manual symlink resolution and a visited-inode set.
 func (w *Watcher) addRecursive(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -104,8 +120,11 @@ func (w *Watcher) loop() {
 	}
 }
 
+// handleEvent performs dynamic directory tracking and filters irrelevant
+// file events before forwarding them downstream.
 func (w *Watcher) handleEvent(ev fsnotify.Event) {
-	// Dynamic directory handling
+	// Newly created directories must be recursively added so we don't miss
+	// changes in code generated into fresh subdirectories (e.g., `go generate`).
 	if ev.Has(fsnotify.Create) {
 		if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
 			if !shouldIgnoreDir(info.Name()) {
@@ -130,6 +149,8 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 }
 
 // shouldIgnoreDir returns true for directories we never want to watch.
+// Hidden directories (dot-prefixed) are excluded because they are almost
+// always metadata (.git, .idea, .vscode) rather than source code.
 func shouldIgnoreDir(name string) bool {
 	return ignoredDirs[name] || strings.HasPrefix(name, ".")
 }

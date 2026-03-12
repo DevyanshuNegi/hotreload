@@ -1,3 +1,6 @@
+// Package main is a minimal HTTP server used to verify hotreload behaviour.
+// The background ticker goroutine specifically validates that process-group
+// killing reaps all goroutines — if it survives a reload, something is wrong.
 package main
 
 import (
@@ -20,7 +23,7 @@ func main() {
 	}()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hello World v1")
+		fmt.Fprintln(w, "Hello World asdfv2 - Ho!")
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

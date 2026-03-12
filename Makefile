@@ -9,3 +9,7 @@ build:
 clean:
 	del /Q hotreload.exe 2>nul || true
 	del /Q testserver\bin.exe 2>nul || true
+
+
+# :TODO: add linux support
+# what -o means after build

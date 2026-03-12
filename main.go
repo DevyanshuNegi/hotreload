@@ -1,3 +1,9 @@
+// Package main is the entry point for the hotreload CLI.
+//
+// hotreload watches a Go project directory for file changes, rebuilds it,
+// and restarts the server binary — forming a watch → debounce → build → exec
+// pipeline. Each stage communicates via channels, keeping the main loop
+// select-driven and free of polling.
 package main
 
 import (
@@ -37,7 +43,8 @@ func main() {
 		"exec", *execCmd,
 	)
 
-	// Phase 2: Start file watcher
+	// Bootstrap the pipeline: watcher → debouncer → builder → executor.
+	// Each component owns a goroutine; teardown propagates via channel closure.
 	w, err := watcher.New(*root)
 	if err != nil {
 		slog.Error("failed to create watcher", "err", err)
@@ -45,19 +52,18 @@ func main() {
 	}
 	defer w.Close()
 
-	// Phase 3: Debounce events (500ms window)
+	// 500ms debounce window prevents rapid-fire rebuilds when editors
+	// perform multi-file saves or atomic rename-write cycles.
 	deb := debounce.New(w.Events, 500*time.Millisecond)
 	defer deb.Close()
 
-	// Phase 4 & 5: Build and execution engines
 	builder := runner.NewBuilder(*buildCmd)
 	executor := runner.NewExecutor(*execCmd)
 
-	// Graceful shutdown
+	// signal.NotifyContext ties OS signal handling to context cancellation,
+	// so the main select cleanly exits on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// Main loop: wait for triggers, build, then run
 	for {
 		select {
 		case <-ctx.Done():
@@ -72,16 +78,18 @@ func main() {
 				return
 			}
 
-			// Cancel any in-flight build and rebuild
+			// Build() cancels any in-flight compilation via its internal context.
+			// context.Canceled means a newer trigger superseded this build — not
+			// a real failure, so we loop and let the next trigger take over.
 			if err := builder.Build(); err != nil {
 				if err == context.Canceled {
-					continue // A newer build superseded this one
+					continue
 				}
 				slog.Error("build failed, waiting for next change", "err", err)
 				continue
 			}
 
-			// Build succeeded — restart the server
+			// Kill the old binary and launch the freshly compiled one.
 			if err := executor.Start(); err != nil {
 				slog.Error("failed to start server", "err", err)
 			}

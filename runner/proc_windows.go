@@ -9,14 +9,18 @@ import (
 	"syscall"
 )
 
-// setProcGroup configures the command to create a new process group (Windows).
+// setProcGroup creates a new process group on Windows via
+// CREATE_NEW_PROCESS_GROUP. This is the Windows equivalent of Unix Setpgid
+// and is required for taskkill /T to reliably discover the full process tree.
 func setProcGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 }
 
-// killProcessGroup kills the process and all children via taskkill /T (Windows).
+// killProcessGroup uses taskkill /T /F to forcefully terminate the process
+// tree. /T walks the tree by PID; /F forces termination since we cannot
+// rely on the server handling WM_CLOSE or CTRL_BREAK gracefully mid-reload.
 func killProcessGroup(cmd *exec.Cmd) {
 	if cmd.Process == nil {
 		return
